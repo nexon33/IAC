@@ -1,833 +1,439 @@
 import os
-import time
+import gym
 import torch
 import numpy as np
-import numpy.random as rd
+# import numpy.random as rd
 from copy import deepcopy
-
-from elegantrl2.replay import ReplayBuffer, ReplayBufferMP
-from elegantrl2.env import deepcopy_or_rebuild_env
 
 """[ElegantRL](https://github.com/AI4Finance-LLC/ElegantRL)"""
 
 
-class Arguments:
-    def __init__(self, agent=None, env=None, gpu_id=None, if_on_policy=False):
-        self.agent = agent  # Deep Reinforcement Learning algorithm
-        self.cwd = None  # current work directory. cwd is None means set it automatically
-        self.env = env  # the environment for training
-        self.env_eval = None  # the environment for evaluating
-        self.gpu_id = gpu_id  # choose the GPU for running. gpu_id is None means set it automatically
-        self.worker_num = 2  # the number of rollout workers (larger is not always faster)
-        self.num_threads = 8  # cpu_num for evaluate model, torch.set_num_threads(self.num_threads)
+class PreprocessEnv(gym.Wrapper):  # environment wrapper
+    def __init__(self, env, if_print=True):
+        """Preprocess a standard OpenAI gym environment for training.
+        `object env` a standard OpenAI gym environment, it has env.reset() and env.step()
+        `bool if_print` print the information of environment. Such as env_name, state_dim ...
+        `object data_type` convert state (sometimes float64) to data_type (float32).
+        """
+        self.env = gym.make(env) if isinstance(env, str) else env
+        super().__init__(self.env)
 
-        '''Arguments for training (off-policy)'''
-        self.learning_rate = 2 ** -14  # 2 ** -14 ~= 6e-5
-        self.soft_update_tau = 2 ** -8  # 2 ** -8 ~= 5e-3
-        self.gamma = 0.99  # discount factor of future rewards
-        self.reward_scale = 2 ** 0  # an approximate target reward usually be closed to 256
+        (self.env_name, self.state_dim, self.action_dim, self.action_max, self.max_step,
+         self.if_discrete, self.target_return) = get_gym_env_info(self.env, if_print)
 
-        if if_on_policy:  # (on-policy)
-            self.net_dim = 2 ** 9  # the network width
-            self.batch_size = self.net_dim * 2  # num of transitions sampled from replay buffer.
-            self.repeat_times = 2 ** 3  # collect target_step, then update network
-            self.target_step = 2 ** 12  # repeatedly update network to keep critic's loss small
-            self.max_memo = self.target_step  # capacity of replay buffer
-            self.if_per_or_gae = False  # GAE for on-policy sparse reward: Generalized Advantage Estimation.
+        state_avg, state_std = get_avg_std__for_state_norm(self.env_name)
+        self.neg_state_avg = -state_avg
+        self.div_state_std = 1 / (state_std + 1e-4)
+
+        self.reset = self.reset_norm
+        self.step = self.step_norm
+
+    def reset_norm(self) -> np.ndarray:
+        """ convert the data type of state from float64 to float32
+        do normalization on state
+        return `array state` state.shape==(state_dim, )
+        """
+        state = self.env.reset()
+        state = (state + self.neg_state_avg) * self.div_state_std
+        return state.astype(np.float32)
+
+    def step_norm(self, action: np.ndarray) -> (np.ndarray, float, bool, dict):
+        """convert the data type of state from float64 to float32,
+        adjust action range to (-action_max, +action_max)
+        do normalization on state
+        return `array state`  state.shape==(state_dim, )
+        return `float reward` reward of one step
+        return `bool done` the terminal of an training episode
+        return `dict info` the information save in a dict. OpenAI gym standard. Send a `None` is OK
+        """
+        state, reward, done, info = self.env.step(action * self.action_max)
+        state = (state + self.neg_state_avg) * self.div_state_std
+        return state.astype(np.float32), reward, done, info
+
+
+class PreprocessVecEnv:  # environment wrapper
+    def __init__(self, env, env_num, if_print=False):
+        env = gym.make(env) if isinstance(env, str) else env
+
+        (self.env_name, self.state_dim, self.action_dim, self.action_max, self.max_step,
+         self.if_discrete, self.target_return) = get_gym_env_info(env, if_print=if_print)
+        self.device = torch.device('cuda')
+        self.env_num = env_num
+
+        self.env_list = [gym.make(self.env_name) for _ in range(env_num)]
+        for i in range(env_num):
+            [self.env_list[i].reset() for _ in range(i)]  # random seed
+
+        state_avg, state_std = get_avg_std__for_state_norm(self.env_name)
+        if state_avg is 0 and state_std is 1:
+            self.neg_avg = 0
+            self.div_std = 1
         else:
-            self.net_dim = 2 ** 8  # the network width
-            self.batch_size = self.net_dim  # num of transitions sampled from replay buffer.
-            self.target_step = 2 ** 10  # collect target_step, then update network
-            self.repeat_times = 2 ** 0  # repeatedly update network to keep critic's loss small
-            self.max_memo = 2 ** 17  # capacity of replay buffer
-            self.if_per_or_gae = False  # PER for off-policy sparse reward: Prioritized Experience Replay.
+            self.neg_avg = -state_avg
+            self.div_std = 1 / (state_std + 1e-4)
 
-        '''Arguments for evaluate'''
-        self.eval_gap = 2 ** 6  # evaluate the agent per eval_gap seconds
-        self.eval_times1 = 2 ** 4
-        self.eval_times2 = 2 ** 6
-        self.random_seed = 0  # initialize random seed in self.init_before_training()
+    def reset_vec(self):
+        if not isinstance(self.neg_avg, torch.Tensor):  # convert np.ndarray to torch.Tensor.cuda()
+            self.neg_avg = torch.as_tensor((self.neg_avg,), dtype=torch.float32, device=self.device)
+            self.neg_avg = self.neg_avg.repeat((self.env_num, 1))
 
-        self.break_step = 2 ** 20  # break training after 'total_step > break_step'
-        self.if_remove = True  # remove the cwd folder? (True, False, None:ask me)
-        self.if_allow_break = True  # allow break training when reach goal (early termination)
+            self.div_std = torch.as_tensor((self.div_std,), dtype=torch.float32, device=self.device)
+            self.div_std = self.div_std.repeat((self.env_num, 1))
 
-    def init_before_training(self, process_id=0):
-        if self.agent is None:
-            raise RuntimeError('\n| Why agent=None? Assignment args.agent = AgentXXX please.')
-        if not hasattr(self.agent, 'init'):
-            raise RuntimeError('\n| Should be agent=AgentXXX() instead of agent=AgentXXX')
-        if self.env is None:
-            raise RuntimeError('\n| Why env=None? Assignment args.env = XxxEnv() please.')
-        if isinstance(self.env, str) or not hasattr(self.env, 'env_name'):
-            raise RuntimeError('\n| What is env.env_name? use env=PreprocessEnv(env). It is a Wrapper.')
+        states = [env.reset() for env in self.env_list]
+        states = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        states = (states + self.neg_avg) * self.div_std
+        return states
 
-        '''set None value automatically'''
-        if self.gpu_id is None:  # set gpu_id as '0' in default
-            self.gpu_id = '0'
+    def step_vec(self, actions):
+        actions = (actions * self.action_max).detach().cpu().numpy()
 
-        if self.cwd is None:
-            agent_name = self.agent.__class__.__name__
-            self.cwd = f'./{self.env.env_name}_{agent_name}_{self.gpu_id}'
+        states = list()
+        rewards = list()
+        dones = list()
+        for i in range(self.env_num):
+            state, reward, done, _ = self.env_list[i].step(actions[i])
+            states.append(self.env_list[i].reset() if done else state)
+            rewards.append(reward)
+            dones.append(done)
 
-        if process_id == 0:
-            print(f'| GPU id: {self.gpu_id}, cwd: {self.cwd}')
-
-            import shutil  # remove history according to bool(if_remove)
-            if self.if_remove is None:
-                self.if_remove = bool(input("PRESS 'y' to REMOVE: {}? ".format(self.cwd)) == 'y')
-            if self.if_remove:
-                shutil.rmtree(self.cwd, ignore_errors=True)
-                print("| Remove history")
-            os.makedirs(self.cwd, exist_ok=True)
-
-        np.random.seed(self.random_seed)
-        torch.manual_seed(self.random_seed)
-        torch.set_num_threads(self.num_threads)
-        torch.set_default_dtype(torch.float32)
-
-        if isinstance(self.gpu_id, tuple) or isinstance(self.gpu_id, list):
-            gpu_id_str = str(self.gpu_id)[1:-1]  # for example "0, 1"
-        else:
-            gpu_id_str = str(self.gpu_id)  # for example "1"
-        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id_str
+        states, rewards, dones = [torch.as_tensor(t, dtype=torch.float32, device=self.device)
+                                  for t in (states, rewards, dones)]
+        states = (states + self.neg_avg) * self.div_std
+        return states, rewards, dones, {}
 
 
-'''single process training'''
+def deepcopy_or_rebuild_env(env):
+    try:
+        env_eval = deepcopy(env)
+    except Exception as error:
+        print('| deepcopy_or_rebuild_env, error:', error)
+        env_eval = PreprocessEnv(env.env_name, if_print=False)
+    return env_eval
 
 
-def train_and_evaluate(args):
-    args.init_before_training()
+def get_avg_std__for_state_norm(env_name) -> (np.ndarray, np.ndarray):
+    """return the state normalization data: neg_avg and div_std
+    ReplayBuffer.print_state_norm() will print `neg_avg` and `div_std`
+    You can save these array to here. And PreprocessEnv will load them automatically.
+    eg. `state = (state + self.neg_state_avg) * self.div_state_std` in `PreprocessEnv.step_norm()`
+    neg_avg = -states.mean()
+    div_std = 1/(states.std()+1e-5) or 6/(states.max()-states.min())
+    `str env_name` the name of environment that helps to find neg_avg and div_std
+    return `array avg` neg_avg.shape=(state_dim)
+    return `array std` div_std.shape=(state_dim)
+    """
+    avg = 0
+    std = 1
+    if env_name == 'LunarLanderContinuous-v2':
+        avg = np.array([1.65470898e-02, -1.29684399e-01, 4.26883133e-03, -3.42124557e-02,
+                        -7.39076972e-03, -7.67103031e-04, 1.12640885e+00, 1.12409466e+00])
+        std = np.array([0.15094465, 0.29366297, 0.23490797, 0.25931464, 0.21603736,
+                        0.25886878, 0.277233, 0.27771219])
+    elif env_name == "BipedalWalker-v3":
+        avg = np.array([1.42211734e-01, -2.74547996e-03, 1.65104509e-01, -1.33418152e-02,
+                        -2.43243194e-01, -1.73886203e-02, 4.24114229e-02, -6.57800099e-02,
+                        4.53460692e-01, 6.08022244e-01, -8.64884810e-04, -2.08789053e-01,
+                        -2.92092949e-02, 5.04791247e-01, 3.33571745e-01, 3.37325723e-01,
+                        3.49106580e-01, 3.70363115e-01, 4.04074671e-01, 4.55838055e-01,
+                        5.36685407e-01, 6.70771701e-01, 8.80356865e-01, 9.97987386e-01])
+        std = np.array([0.84419678, 0.06317835, 0.16532085, 0.09356959, 0.486594,
+                        0.55477525, 0.44076614, 0.85030824, 0.29159821, 0.48093035,
+                        0.50323634, 0.48110776, 0.69684234, 0.29161077, 0.06962932,
+                        0.0705558, 0.07322677, 0.07793258, 0.08624322, 0.09846895,
+                        0.11752805, 0.14116005, 0.13839757, 0.07760469])
+    elif env_name == 'ReacherBulletEnv-v0':
+        avg = np.array([0.03149641, 0.0485873, -0.04949671, -0.06938662, -0.14157104,
+                        0.02433294, -0.09097818, 0.4405931, 0.10299437], dtype=np.float32)
+        std = np.array([0.12277275, 0.1347579, 0.14567468, 0.14747661, 0.51311225,
+                        0.5199606, 0.2710207, 0.48395795, 0.40876198], dtype=np.float32)
+    elif env_name == 'AntBulletEnv-v0':
+        avg = np.array([-1.4400886e-01, -4.5074993e-01, 8.5741436e-01, 4.4249415e-01,
+                        -3.1593361e-01, -3.4174921e-03, -6.1666980e-02, -4.3752361e-03,
+                        -8.9226037e-02, 2.5108769e-03, -4.8667483e-02, 7.4835382e-03,
+                        3.6160579e-01, 2.6877613e-03, 4.7474738e-02, -5.0628246e-03,
+                        -2.5761038e-01, 5.9789192e-04, -2.1119279e-01, -6.6801407e-03,
+                        2.5196713e-01, 1.6556121e-03, 1.0365561e-01, 1.0219718e-02,
+                        5.8209229e-01, 7.7563477e-01, 4.8815918e-01, 4.2498779e-01],
+                       dtype=np.float32)
+        std = np.array([0.04128463, 0.19463477, 0.15422264, 0.16463493, 0.16640785,
+                        0.08266512, 0.10606721, 0.07636797, 0.7229637, 0.52585346,
+                        0.42947173, 0.20228386, 0.44787514, 0.33257666, 0.6440182,
+                        0.38659114, 0.6644085, 0.5352245, 0.45194066, 0.20750992,
+                        0.4599643, 0.3846344, 0.651452, 0.39733195, 0.49320385,
+                        0.41713253, 0.49984455, 0.4943505], dtype=np.float32)
+    elif env_name == 'HumanoidBulletEnv-v0':
+        avg = np.array([-1.25880212e-01, -8.51390958e-01, 7.07488894e-01, -5.72232604e-01,
+                        -8.76260102e-01, -4.07587215e-02, 7.27005303e-04, 1.23370838e+00,
+                        -3.68912554e+00, -4.75829793e-03, -7.42472351e-01, -8.94218776e-03,
+                        1.29535913e+00, 3.16205365e-03, 9.13809776e-01, -6.42679911e-03,
+                        8.90435696e-01, -7.92571157e-03, 6.54826105e-01, 1.82383414e-02,
+                        1.20868635e+00, 2.90832808e-03, -9.96598601e-03, -1.87555347e-02,
+                        1.66691601e+00, 7.45300390e-03, -5.63859344e-01, 5.48619963e-03,
+                        1.33900166e+00, 1.05895223e-02, -8.30249667e-01, 1.57017610e-03,
+                        1.92912612e-02, 1.55787319e-02, -1.19833803e+00, -8.22103582e-03,
+                        -6.57119334e-01, -2.40323972e-02, -1.05282271e+00, -1.41856335e-02,
+                        8.53593826e-01, -1.73063378e-03, 5.46878874e-01, 5.43514848e-01],
+                       dtype=np.float32)
+        std = np.array([0.08138401, 0.41358876, 0.33958328, 0.17817754, 0.17003846,
+                        0.15247536, 0.690917, 0.481272, 0.40543965, 0.6078898,
+                        0.46960834, 0.4825346, 0.38099176, 0.5156369, 0.6534775,
+                        0.45825616, 0.38340876, 0.89671516, 0.14449312, 0.47643778,
+                        0.21150663, 0.56597894, 0.56706554, 0.49014297, 0.30507362,
+                        0.6868296, 0.25598812, 0.52973163, 0.14948095, 0.49912784,
+                        0.42137524, 0.42925757, 0.39722264, 0.54846555, 0.5816031,
+                        1.139402, 0.29807225, 0.27311933, 0.34721208, 0.38530213,
+                        0.4897849, 1.0748593, 0.30166605, 0.30824476], dtype=np.float32)
+    # elif env_name == 'MinitaurBulletEnv-v0': # need check
+    #     avg = np.array([0.90172989, 1.54730119, 1.24560906, 1.97365306, 1.9413892,
+    #                     1.03866835, 1.69646277, 1.18655352, -0.45842347, 0.17845232,
+    #                     0.38784456, 0.58572877, 0.91414561, -0.45410697, 0.7591031,
+    #                     -0.07008998, 3.43842258, 0.61032482, 0.86689961, -0.33910894,
+    #                     0.47030415, 4.5623528, -2.39108079, 3.03559422, -0.36328256,
+    #                     -0.20753499, -0.47758384, 0.86756409])
+    #     std = np.array([0.34192648, 0.51169916, 0.39370621, 0.55568461, 0.46910769,
+    #                     0.28387504, 0.51807949, 0.37723445, 13.16686185, 17.51240024,
+    #                     14.80264211, 16.60461412, 15.72930229, 11.38926597, 15.40598346,
+    #                     13.03124941, 2.47718145, 2.55088804, 2.35964651, 2.51025567,
+    #                     2.66379017, 2.37224904, 2.55892521, 2.41716885, 0.07529733,
+    #                     0.05903034, 0.1314812, 0.0221248])
+    return avg, std
 
-    if True:
-        '''basic arguments'''
-        cwd = args.cwd
-        env = args.env
-        agent = args.agent
-        gpu_id = args.gpu_id
 
-        '''training arguments'''
-        net_dim = args.net_dim
-        max_memo = args.max_memo
-        break_step = args.break_step
-        batch_size = args.batch_size
-        target_step = args.target_step
-        repeat_times = args.repeat_times
-        learning_rate = args.learning_rate
-        if_break_early = args.if_allow_break
+def get_gym_env_info(env, if_print) -> (str, int, int, int, int, bool, float):
+    """get information of a standard OpenAI gym env.
+    The DRL algorithm AgentXXX need these env information for building networks and training.
+    `object env` a standard OpenAI gym environment, it has env.reset() and env.step()
+    `bool if_print` print the information of environment. Such as env_name, state_dim ...
+    return `env_name` the environment name, such as XxxXxx-v0
+    return `state_dim` the dimension of state
+    return `action_dim` the dimension of continuous action; Or the number of discrete action
+    return `action_max` the max action of continuous action; action_max == 1 when it is discrete action space
+    return `max_step` the steps in an episode. (from env.reset to done). It breaks an episode when it reach max_step
+    return `if_discrete` Is this env a discrete action space?
+    return `target_return` the target episode return, if agent reach this score, then it pass this game (env).
+    """
+    assert isinstance(env, gym.Env)
 
-        gamma = args.gamma
-        reward_scale = args.reward_scale
-        if_per_or_gae = args.if_per_or_gae
-        soft_update_tau = args.soft_update_tau
+    env_name = getattr(env, 'env_name', None)
+    env_name = env.unwrapped.spec.id if env_name is None else None
 
-        '''evaluating arguments'''
-        show_gap = args.eval_gap
-        eval_times1 = args.eval_times1
-        eval_times2 = args.eval_times2
-        # if_vec_env = getattr(env, 'env_num', 1) > 1
-        env_eval = deepcopy_or_rebuild_env(env) if args.env_eval is None else args.env_eval
-        del args
+    state_shape = env.observation_space.shape
+    state_dim = state_shape[0] if len(state_shape) == 1 else state_shape  # sometimes state_dim is a list
 
-    '''init: environment'''
-    state_dim = env.state_dim
-    action_dim = env.action_dim
-    env_eval = deepcopy(env) if env_eval is None else deepcopy(env_eval)
+    target_return = getattr(env, 'target_return', None)
+    target_return_default = getattr(env.spec, 'reward_threshold', None)
+    if target_return is None:
+        target_return = target_return_default
+    if target_return is None:
+        target_return = 2 ** 16
 
-    '''init: Agent, Evaluator, '''
-    agent.init(net_dim, state_dim, action_dim, learning_rate, if_per_or_gae)
-    if_on_policy = getattr(agent, 'if_on_policy', False)
+    max_step = getattr(env, 'max_step', None)
+    max_step_default = getattr(env, '_max_episode_steps', None)
+    if max_step is None:
+        max_step = max_step_default
+    if max_step is None:
+        max_step = 2 ** 10
 
-    evaluator = Evaluator(cwd=cwd, agent_id=gpu_id, device=agent.device, env=env_eval,
-                          eval_times1=eval_times1, eval_times2=eval_times2, eval_gap=show_gap)  # build Evaluator
-
-    '''init ReplayBuffer'''
-    if if_on_policy:
-        buffer = tuple()
+    if_discrete = isinstance(env.action_space, gym.spaces.Discrete)
+    if if_discrete:  # make sure it is discrete action space
+        action_dim = env.action_space.n
+        action_max = int(1)
+    elif isinstance(env.action_space, gym.spaces.Box):  # make sure it is continuous action space
+        action_dim = env.action_space.shape[0]
+        action_max = float(env.action_space.high[0])
+        assert not any(env.action_space.high + env.action_space.low)
     else:
-        buffer = ReplayBuffer(max_len=max_memo, state_dim=state_dim, action_dim=action_dim, if_use_per=if_per_or_gae)
-        with torch.no_grad():  # update replay buffer
-            trajectory_list = explore_before_training(env, target_step, reward_scale, gamma)
-            steps = len(trajectory_list)
-
-            state = torch.as_tensor([item[0] for item in trajectory_list], dtype=torch.float32)
-            other = torch.as_tensor([item[1] for item in trajectory_list], dtype=torch.float32)
-            buffer.extend_buffer(state, other)
-
-        agent.state = state
-        agent.update_net(buffer, target_step, batch_size, repeat_times)
-
-        # hard update for the first time
-        agent.act_target.load_state_dict(agent.act.state_dict()) if getattr(agent, 'act_target', None) else None
-        agent.cri_target.load_state_dict(agent.cri.state_dict()) if getattr(agent, 'cri_target', None) else None
-
-        evaluator.total_step += steps
-
-    '''start training'''
-    agent.state = env.reset()
-    if_train = True
-    if if_on_policy:
-        while if_train:
-            with torch.no_grad():
-                if if_on_policy:
-                    trajectory_list = agent.explore_env(env, target_step, reward_scale, gamma)
-                    buffer = agent.prepare_buffer(trajectory_list)
-                    # buffer = (state, action, r_sum, logprob, advantage)
-
-                    # assert isinstance(buffer, tuple)
-                    steps = buffer[2].size(0)  # buffer[2] = r_sum
-                    r_exp = buffer[2].mean().item()  # buffer[2] = r_sum
-                else:
-                    trajectory_list = agent.explore_env(env, target_step, reward_scale, gamma)
-                    state = torch.as_tensor([item[0] for item in trajectory_list], dtype=torch.float32)
-                    other = torch.as_tensor([item[1] for item in trajectory_list], dtype=torch.float32)
-                    buffer.extend_buffer(state, other)
-
-                    # assert isinstance(buffer, ReplayBuffer)
-                    steps = other.size()[0]
-                    r_exp = other[:, 0].mean().item()  # other = (reward, mask, ...)
-
-            logging_tuple = agent.update_net(buffer, batch_size, repeat_times, soft_update_tau)
-
-            with torch.no_grad():
-                if_reach_goal = evaluator.evaluate_and_save(agent.act, steps, r_exp, logging_tuple)
-                if_train = not ((if_break_early and if_reach_goal)
-                                or evaluator.total_step > break_step
-                                or os.path.exists(f'{cwd}/stop'))
-
-    print(f'| UsedTime: {time.time() - evaluator.start_time:.0f} | SavedDir: {cwd}')
-
-
-'''multiple processing training'''
-
-
-def train_and_evaluate_mp(args):  # multiple processing
-    import multiprocessing as mp  # Python built-in multiprocessing library
-    process = list()
-
-    pipe_eva = mp.Pipe()
-    pipe_exp_list = [mp.Pipe() for _ in range(args.worker_num)]
-
-    process.append(mp.Process(target=mp_learner, args=(args, pipe_eva, pipe_exp_list)))
-    process.append(mp.Process(target=mp_evaluator, args=(args, pipe_eva)))
-    process.extend([mp.Process(target=mp_worker, args=(args, pipe_exp_list[worker_id], worker_id))
-                    for worker_id in range(args.worker_num)])
-
-    [p.start() for p in process]
-    process[0].join()
-    process_safely_terminate(process)
-
-
-def mp_worker(args, pipe_exp, worker_id, learner_id=0):
-    args.random_seed += worker_id + learner_id * args.worker_num
-    args.init_before_training(process_id=-1)
-
-    if True:
-        '''arguments: basic'''
-        # cwd = args.cwd
-        env = args.env
-        agent = args.agent
-        # gpu_id = args.gpu_id
-        # worker_num = args.worker_num
-
-        '''arguments: train'''
-        net_dim = args.net_dim
-        # max_memo = args.max_memo
-        # break_step = args.break_step
-        # batch_size = args.batch_size
-        target_step = args.target_step
-        # repeat_times = args.repeat_times
-        learning_rate = args.learning_rate
-        # if_break_early = args.if_allow_break
-
-        gamma = args.gamma
-        reward_scale = args.reward_scale
-        if_per_or_gae = args.if_per_or_gae
-        # soft_update_tau = args.soft_update_tau
-
-        '''arguments: evaluate'''
-        # show_gap = args.eval_gap
-        # eval_times1 = args.eval_times1
-        # eval_times2 = args.eval_times2
-        # env_eval = deepcopy_or_rebuild_env(env) if args.env_eval is None else args.env_eval
-
-        '''arguments: environment'''
-        # max_step = env.max_step
-        state_dim = env.state_dim
-        action_dim = env.action_dim
-        # if_discrete = env.if_discrete
-        del args  # In order to show these hyper-parameters clearly, I put them above.
-
-    env.device = torch.device(f'cuda:{learner_id}')
-    env_num = getattr(env, 'env_num', 0)
-    '''init: Agent, ReplayBuffer, Evaluator'''
-    agent.init(net_dim, state_dim, action_dim, learning_rate, if_per_or_gae, learner_id)
-    # agent.act.eval()
-    # [setattr(param, 'requires_grad', False) for param in agent.act.parameters()]
-
-    if_on_policy = agent.if_on_policy
-
-    if env_num:
-        agent.state = env.reset_vec()
-        agent.env_tensors = [[torch.zeros(0, dtype=torch.float32, device=agent.device)
-                              for _ in range(5)]
-                             for _ in range(env.env_num)]
-        # 5 == len(states, actions, r_sums, logprobs, advantages)
-
-        with torch.no_grad():
-            while True:
-                # pipe_exp[1].send((agent.act.state_dict(), agent.cri_target.state_dict()))
-                act_state_dict, cri_target_state_dict = pipe_exp[0].recv()
-
-                agent.act.load_state_dict(act_state_dict)
-                agent.cri_target.load_state_dict(cri_target_state_dict)
-
-                buffer = agent.explore_envs(env, target_step, reward_scale, gamma)
-                buffer_tuple = agent.prepare_buffers(buffer)
-
-                pipe_exp[0].send(buffer_tuple)
-                # buffer_tuple = pipe_exp[1].recv()
-
-    agent.state = env.reset()
-    with torch.no_grad():
-        while True:
-            # pipe_exp[1].send((act_state_dict, cri_target_state_dict))
-            act_state_dict, cri_target_state_dict = pipe_exp[0].recv()
-
-            agent.act.load_state_dict(act_state_dict)
-            agent.cri_target.load_state_dict(cri_target_state_dict)
-
-            if if_on_policy:
-                buffer = agent.explore_env(env, target_step, reward_scale, gamma)
-                buffer_tuple = agent.prepare_buffer(buffer)  # buffer_tuple
-            else:
-                trajectory_list = agent.explore_env(env, target_step, reward_scale, gamma)
-                state = torch.as_tensor([item[0] for item in trajectory_list], dtype=torch.float32, device=agent.device)
-                other = torch.as_tensor([item[1] for item in trajectory_list], dtype=torch.float32, device=agent.device)
-                buffer_tuple = (state, other)
-
-            pipe_exp[0].send(buffer_tuple)
-            # buffer_tuple = pipe_exp[1].recv()
-
-
-def mp_learner(args, pipe_eva, pipe_exp_list, pipe_net_list=None, learner_id=0):
-    args.init_before_training(process_id=learner_id)
-
-    if True:
-        '''arguments: basic'''
-        # cwd = args.cwd
-        env = args.env
-        agent = args.agent
-        # gpu_id = args.gpu_id
-        worker_num = args.worker_num
-
-        '''arguments: train'''
-        net_dim = args.net_dim
-        max_memo = args.max_memo
-        # break_step = args.break_step
-        batch_size = args.batch_size
-        target_step = args.target_step
-        repeat_times = args.repeat_times
-        learning_rate = args.learning_rate
-        # if_break_early = args.if_allow_break
-
-        gamma = args.gamma
-        reward_scale = args.reward_scale
-        if_per_or_gae = args.if_per_or_gae
-        soft_update_tau = args.soft_update_tau
-
-        '''arguments: evaluate'''
-        # show_gap = args.eval_gap
-        # eval_times1 = args.eval_times1
-        # eval_times2 = args.eval_times2
-        # env_eval = deepcopy_or_rebuild_env(env) if args.env_eval is None else args.env_eval
-
-        '''arguments: environment'''
-        # max_step = env.max_step
-        state_dim = env.state_dim
-        action_dim = env.action_dim
-        if_discrete = env.if_discrete
-        del args  # In order to show these hyper-parameters clearly, I put them above.
-
-    '''init: Comm'''
-    comm = LearnerComm(pipe_net_list, learner_id) if pipe_net_list is not None else None
-
-    '''init: Agent'''
-    agent.init(net_dim, state_dim, action_dim, learning_rate, if_per_or_gae, learner_id)
-    if_on_policy = agent.if_on_policy
-
-    '''init: ReplayBuffer'''
-    if if_on_policy:
-        steps = 0
-        buffer = list()
-    else:  # explore_before_training for off-policy
-        buffer = ReplayBufferMP(max_len=target_step if if_on_policy else max_memo, worker_num=worker_num,
-                                if_on_policy=if_on_policy, if_per_or_gae=if_per_or_gae,
-                                state_dim=state_dim, action_dim=action_dim, if_discrete=if_discrete, )
-
-        with torch.no_grad():  # update replay buffer
-            trajectory_list = explore_before_training(env, target_step, reward_scale, gamma)
-            steps = len(trajectory_list)
-
-            buffer.buffers[0].extend_buffer_from_list(trajectory_list)
-        agent.update_net(buffer, target_step, batch_size, repeat_times)  # pre-training and hard update
-
-        # hard update for the first time
-        agent.act_target.load_state_dict(agent.act.state_dict()) if getattr(agent, 'act_target', None) else None
-        agent.cri_target.load_state_dict(agent.cri.state_dict()) if getattr(agent, 'cri_target', None) else None
-
-    '''init: Evaluator'''
-    # evaluator = Evaluator(cwd=cwd, agent_id=gpu_id, device=agent.device, env=env_eval,
-    #                       eval_times1=eval_times1, eval_times2=eval_times2, eval_gap=show_gap)  # build Evaluator
-    act_cpu = deepcopy(agent.act).to(torch.device("cpu"))  # for pipe1_eva
-    act_cpu.eval()
-    [setattr(param, 'requires_grad', False) for param in act_cpu.parameters()]
-    if learner_id == 0:
-        pipe_eva[1].send((act_cpu, steps))
-        # act_cpu, steps = pipe_eva[0].recv()
-
-    '''start training'''
-    if_train = True
-    while if_train:
-        '''explore'''
-        for pipe_exp in pipe_exp_list:
-            pipe_exp[1].send((agent.act.state_dict(), agent.cri_target.state_dict()))
-            # act_state_dict, cri_target_state_dict = pipe_exp[0].recv()
-
-        steps = 0
-        r_exp = 0
-        buffer_tuples = list()
-        for pipe_exp in pipe_exp_list:
-            # pipe_exp[0].send(buffer_tuple)
-            buffer_tuples.append(pipe_exp[1].recv())
-
-        if if_on_policy:
-            buffer = list()
-            for buffer_tuple in buffer_tuples:
-                steps += buffer_tuple[2].size(0)  # buffer[2] = r_sum
-                r_exp += buffer_tuple[2].mean().item()  # buffer[2] = r_sum
-                buffer.append(buffer_tuple)
-
-            if (buffer_tuples is not None) and (comm is not None):
-                buffer_tuples = comm.comm(buffer_tuples, 0, if_cuda=True)
-                for buffer_tuple in buffer_tuples:
-                    buffer.append(buffer_tuple)
-        else:
-            for i in range(worker_num):
-                state, other = buffer_tuples[i]
-                steps += other.size()[0]
-                r_exp += other[:, 0].mean().item()  # other = (reward, mask, ...)
-                buffer.buffers[i].extend_buffer(state, other)
-
-            if comm is not None:
-                buffer_tuples = comm.comm(buffer_tuples, 0)
-                for i in range(worker_num):
-                    state, other = buffer_tuples[i]
-                    buffer.buffers[i].extend_buffer(state, other)
-
-        logging_tuple = agent.update_net(buffer, batch_size, repeat_times, soft_update_tau)
-        if comm is not None:
-            for round_id in range(comm.round_num):
-                data = agent.act, agent.cri, agent.act_optim, agent.cri_optim,
-                data = comm.comm(data, round_id)
-
-                if data is None:
-                    continue
-                # isinstance(data, tuple):
-                avg_update_net(agent.act, data[0], agent.device)
-                avg_update_net(agent.cri, data[1], agent.device)
-                avg_update_optim(agent.act_optim, data[2], agent.device)
-                avg_update_optim(agent.cri_optim, data[3], agent.device)
-
-        '''evaluate'''
-        if learner_id == 0:
-            if not pipe_eva[0].poll():
-                act_cpu.load_state_dict(agent.act.state_dict())
-                act_state_dict = act_cpu.state_dict()
-            else:
-                act_state_dict = None
-            pipe_eva[1].send((act_state_dict, steps, r_exp, logging_tuple))
-            # act_state_dict, steps, r_exp, logging_tuple = pipe_eva[0].recv()
-
-        if pipe_eva[1].poll():
-            # pipe_eva[0].send(if_train)
-            if_train = pipe_eva[1].recv()
-
-    comm.close_comm() if comm is not None else None
-    empty_pipe_list(pipe_eva)
-    for pipe_exp in pipe_exp_list:
-        empty_pipe_list(pipe_exp)
-
-
-def mp_evaluator(args, pipe_eva, learner_id=0):
-    args.init_before_training(process_id=-1)
-
-    if True:
-        '''arguments: basic'''
-        cwd = args.cwd
-        env = args.env
-        agent = args.agent
-        gpu_id = args.gpu_id
-        # worker_num = args.worker_num
-
-        '''arguments: train'''
-        # net_dim = args.net_dim
-        # max_memo = args.max_memo
-        break_step = args.break_step
-        # batch_size = args.batch_size
-        # target_step = args.target_step
-        # repeat_times = args.repeat_times
-        # learning_rate = args.learning_rate
-        if_break_early = args.if_allow_break
-
-        # gamma = args.gamma
-        # reward_scale = args.reward_scale
-        # if_per_or_gae = args.if_per_or_gae
-        # soft_update_tau = args.soft_update_tau
-
-        '''arguments: evaluate'''
-        show_gap = args.eval_gap
-        eval_times1 = args.eval_times1
-        eval_times2 = args.eval_times2
-        env_eval = deepcopy_or_rebuild_env(env) if args.env_eval is None else args.env_eval
-
-        '''arguments: environment'''
-        # max_step = env.max_step
-        # state_dim = env.state_dim
-        # action_dim = env.action_dim
-        # if_discrete = env.if_discrete
-        del args  # In order to show these hyper-parameters clearly, I put them above.
-
-    '''init: Evaluator'''
-    learner_num = 1 if isinstance(gpu_id, int) else len(gpu_id)
-    gpu_id = gpu_id if isinstance(gpu_id, int) else gpu_id[learner_id]
-    evaluator = Evaluator(cwd=cwd, agent_id=gpu_id, device=agent.device, env=env_eval,
-                          eval_times1=eval_times1, eval_times2=eval_times2, eval_gap=show_gap)  # build Evaluator
-    evaluator.eval_time += learner_id * (show_gap / learner_num)
-
-    # pipe_eva[1].send((act_cpu, steps))
-    act_cpu, steps = pipe_eva[0].recv()
-
-    '''start training'''
-    sum_step = steps
-    if_train = True
-    while if_train:
-        # pipe_eva[1].send((act_state_dict, steps, r_exp, logging_tuple))
-        act_state_dict, steps, r_exp, logging_tuple = pipe_eva[0].recv()
-
-        sum_step += steps
-        if act_state_dict is not None:
-            act_cpu.load_state_dict(act_state_dict)
-
-            if_reach_goal = evaluator.evaluate_and_save(act_cpu, sum_step, r_exp, logging_tuple)
-            sum_step = 0
-
-            if_train = not ((if_break_early and if_reach_goal)
-                            or evaluator.total_step > break_step
-                            or os.path.exists(f'{cwd}/stop'))
-
-    print(f'| SavedDir: {cwd}\n'
-          f'| UsedTime: {time.time() - evaluator.start_time:.0f}')
-    pipe_eva[0].send(if_train)
-    # if_train = pipe_eva[1].recv()
-
-
-def process_safely_terminate(process):
-    for p in process:
-        try:
-            p.terminate()
-        except OSError as e:
-            print(e)
-            pass
-
-
-def empty_pipe_list(pipe_list):
-    for pipe in pipe_list:
-        try:
-            while pipe.poll():
-                pipe.recv()
-        except EOFError:
-            pass
-
-
-'''multiple GPU training'''
-
-
-def train_and_evaluate_mg(args):  # multiple GPU
-    import multiprocessing as mp  # Python built-in multiprocessing library
-    process = list()
-
-    pipe_net_list = [mp.Pipe() for _ in args.gpu_id]
-    pipe_eva_list = [mp.Pipe() for _ in args.gpu_id]
-
-    for learner_id in range(len(args.gpu_id)):
-        pipe_exp_list = [mp.Pipe() for _ in range(args.worker_num)]
-        pipe_eva = pipe_eva_list[learner_id]
-
-        process.append(mp.Process(target=mp_learner, args=(args, pipe_eva, pipe_exp_list, pipe_net_list, learner_id)))
-        process.extend([mp.Process(target=mp_worker, args=(args, pipe_exp_list[worker_id], worker_id, learner_id))
-                        for worker_id in range(args.worker_num)])
-
-    learner_id = 0
-    pipe_eva = pipe_eva_list[learner_id]
-    process.append(mp.Process(target=mp_evaluator, args=(args, pipe_eva, learner_id)))
-
-    [p.start() for p in process]
-    process[0].join()  # wait
-    for learner_id in range(len(args.gpu_id)):
-        pipe_eva = pipe_eva_list[learner_id]
-        pipe_net = pipe_net_list[learner_id]
-
-        pipe_eva[0].send(False)
-        [pipe_net[0].send(None) for _ in range(3)]
-    process_safely_terminate(process[1:])
-
-
-class LearnerComm:
-    def __init__(self, pipe_net_list, learner_id):
-        pipe_num = len(pipe_net_list)
-        self.pipe_net_list = pipe_net_list
-        self.device_list = [torch.device(f'cuda:{i}') for i in range(pipe_num)]
-
-        if pipe_num == 2:
-            self.round_num = 1
-            if learner_id == 0:
-                self.pipe0 = pipe_net_list[0]
-                self.idx_l = (1,)
-            else:  # if learner_id == 1:
-                self.pipe0 = pipe_net_list[1]
-                self.idx_l = (0,)
-        else:  # if pipe_num == 4:
-            self.round_num = 1
-            if learner_id == 0:
-                self.pipe0 = pipe_net_list[learner_id]
-                self.idx_l = (1, 2)
-            elif learner_id == 1:
-                self.pipe0 = pipe_net_list[learner_id]
-                self.idx_l = (0, 3)
-            elif learner_id == 2:
-                self.pipe0 = pipe_net_list[learner_id]
-                self.idx_l = (3, 1)
-            else:  # if learner_id == 3:
-                self.pipe0 = pipe_net_list[learner_id]
-                self.idx_l = (2, 1)
-
-    def comm(self, data, round_id, if_cuda=False):
-        idx = self.idx_l[round_id]
-
-        if if_cuda:
-            data = [[t.to(self.device_list[idx]) for t in item]
-                    for item in data]
-
-        self.pipe_net_list[idx][0].send(data)
-        return self.pipe0[1].recv()
-
-    def close_comm(self):
-        for pipe_net in self.pipe_net_list:
-            empty_pipe_list(pipe_net)
-
-
-def get_optim_parameters(optim):  # for avg_update_optim()
-    params_list = list()
-    for params_dict in optim.state_dict()['state'].values():
-        params_list.extend([t for t in params_dict.values() if isinstance(t, torch.Tensor)])
-    return params_list
-
-
-def avg_update_optim(dst_optim, src_optim, device):
-    for dst, src in zip(get_optim_parameters(dst_optim),
-                        get_optim_parameters(src_optim)):
-        dst.data.copy_((dst.data + src.data.to(device)) * 0.5)
-        # dst.data.copy_(src.data * tau + dst.data * (1 - tau))
-
-
-def avg_update_net(dst_net, src_net, device):
-    for tar, cur in zip(dst_net.parameters(), src_net.parameters()):
-        tar.data.copy_((tar.data + cur.data.to(device)) * 0.5)
-
-
-'''utils'''
-
-
-class Evaluator:
-    def __init__(self, cwd, agent_id, eval_times1, eval_times2, eval_gap, env, device):
-        self.recorder = list()  # total_step, r_avg, r_std, obj_c, ...
-        self.r_max = -np.inf
-        self.total_step = 0
-
-        self.env = env
-        self.cwd = cwd
-        self.device = device
-        self.agent_id = agent_id
-        self.eval_gap = eval_gap
-        self.eval_times1 = eval_times1
-        self.eval_times2 = eval_times2
-        self.target_return = env.target_return
-
-        self.used_time = None
-        self.start_time = time.time()
-        self.eval_time = 0
-        print(f"{'#' * 80}\n"
-              f"{'Step':>8}{'maxR':>8} |"
-              f"{'avgR':>8}{'stdR':>7}{'avgS':>7}{'stdS':>6} |"
-              f"{'expR':>8}{'objC':>8}{'etc.':>8}")
-
-    def evaluate_and_save(self, act, steps, r_exp, log_tuple) -> bool:
-        self.total_step += steps  # update total training steps
-
-        if time.time() - self.eval_time < self.eval_gap:
-            return False  # if_reach_goal
-
-        self.eval_time = time.time()
-        rewards_steps_list = [get_episode_return_and_step(self.env, act, self.device) for _ in
-                              range(self.eval_times1)]
-        r_avg, r_std, s_avg, s_std = self.get_r_avg_std_s_avg_std(rewards_steps_list)
-
-        if r_avg > self.r_max:  # evaluate actor twice to save CPU Usage and keep precision
-            rewards_steps_list += [get_episode_return_and_step(self.env, act, self.device)
-                                   for _ in range(self.eval_times2 - self.eval_times1)]
-            r_avg, r_std, s_avg, s_std = self.get_r_avg_std_s_avg_std(rewards_steps_list)
-        if r_avg > self.r_max:  # save checkpoint with highest episode return
-            self.r_max = r_avg  # update max reward (episode return)
-
-            act_save_path = f'{self.cwd}/actor.pth'
-            torch.save(act.state_dict(), act_save_path)  # save policy network in *.pth
-            print(f"{self.total_step:8.2e}{self.r_max:8.2f} |")  # save policy and print
-
-        self.recorder.append((self.total_step, r_avg, r_std, *log_tuple))  # update recorder
-
-        if_reach_goal = bool(self.r_max > self.target_return)  # check if_reach_goal
-        if if_reach_goal and self.used_time is None:
-            self.used_time = int(time.time() - self.start_time)
-            print(f"{'Step':>8}{'TargetR':>8} |"
-                  f"{'avgR':>8}{'stdR':>7}{'avgS':>7}{'stdS':>6} |"
-                  f"{'UsedTime':>8}  ########\n"
-                  f"{self.total_step:8.2e}{self.target_return:8.2f} |"
-                  f"{r_avg:8.2f}{r_std:7.1f}{s_avg:7.0f}{s_std:6.0f} |"
-                  f"{self.used_time:>8}  ########")
-
-        print(f"{self.total_step:8.2e}{self.r_max:8.2f} |"
-              f"{r_avg:8.2f}{r_std:7.1f}{s_avg:7.0f}{s_std:6.0f} |"
-              f"{r_exp:8.2f}{''.join(f'{n:8.2f}' for n in log_tuple)}")
-        self.draw_plot()
-        return if_reach_goal
-
-    def draw_plot(self):
-        if len(self.recorder) == 0:
-            print("| save_npy_draw_plot() WARNNING: len(self.recorder)==0")
-            return None
-
-        '''convert to array and save as npy'''
-        np.save('%s/recorder.npy' % self.cwd, self.recorder)
-
-        '''draw plot and save as png'''
-        train_time = int(time.time() - self.start_time)
-        total_step = int(self.recorder[-1][0])
-        save_title = f"step_time_maxR_{int(total_step)}_{int(train_time)}_{self.r_max:.3f}"
-
-        save_learning_curve(self.recorder, self.cwd, save_title)
-
-    @staticmethod
-    def get_r_avg_std_s_avg_std(rewards_steps_list):
-        rewards_steps_ary = np.array(rewards_steps_list, dtype=np.float)
-        r_avg, s_avg = rewards_steps_ary.mean(axis=0)  # average of episode return and episode step
-        r_std, s_std = rewards_steps_ary.std(axis=0)  # standard dev. of episode return and episode step
-        return r_avg, r_std, s_avg, s_std
-
-
-def get_episode_return_and_step(env, act, device) -> (float, int):
-    episode_return = 0.0  # sum of rewards in an episode
-    episode_step = 1
-    max_step = env.max_step
-    if_discrete = env.if_discrete
-
-    state = env.reset()
-    for episode_step in range(max_step):
-        s_tensor = torch.as_tensor((state,), device=device)
-        a_tensor = act(s_tensor)
-        if if_discrete:
-            a_tensor = a_tensor.argmax(dim=1)
-        action = a_tensor.detach().cpu().numpy()[0]  # not need detach(), because with torch.no_grad() outside
+        raise RuntimeError('| Please set these value manually: if_discrete=bool, action_dim=int, action_max=1.0')
+
+    print(f"\n| env_name:  {env_name}, action space if_discrete: {if_discrete}"
+          f"\n| state_dim: {state_dim:4}, action_dim: {action_dim}, action_max: {action_max}"
+          f"\n| max_step:  {max_step:4}, target_return: {target_return}") if if_print else None
+    return env_name, state_dim, action_dim, action_max, max_step, if_discrete, target_return
+
+
+"""Custom environment: Fix Env"""
+
+
+def fix_car_racing_env(env, frame_num=3, action_num=3) -> gym.Wrapper:  # 2020-12-12
+    setattr(env, 'old_step', env.step)  # env.old_step = env.step
+    setattr(env, 'env_name', 'CarRacing-Fix')
+    setattr(env, 'state_dim', (frame_num, 96, 96))
+    setattr(env, 'action_dim', 3)
+    setattr(env, 'if_discrete', False)
+    setattr(env, 'target_return', 700)  # 900 in default
+
+    setattr(env, 'state_stack', None)  # env.state_stack = None
+    setattr(env, 'avg_reward', 0)  # env.avg_reward = 0
+    """ cancel the print() in environment
+    comment 'car_racing.py' line 233-234: print('Track generation ...
+    comment 'car_racing.py' line 308-309: print("retry to generate track ...
+    """
+
+    def rgb2gray(rgb):
+        # # rgb image -> gray [0, 1]
+        # gray = np.dot(rgb[..., :], [0.299, 0.587, 0.114]).astype(np.float32)
+        # if norm:
+        #     # normalize
+        #     gray = gray / 128. - 1.
+        # return gray
+
+        state = rgb[:, :, 1]  # show green
+        state[86:, 24:36] = rgb[86:, 24:36, 2]  # show red
+        state[86:, 72:] = rgb[86:, 72:, 0]  # show blue
+        state = (state - 128).astype(np.float32) / 128.
+        return state
+
+    def decorator_step(env_step):
+        def new_env_step(action):
+            action = action.copy()
+            action[1:] = (action[1:] + 1) / 2  # fix action_space.low
+
+            reward_sum = 0
+            done = state = None
+            try:
+                for _ in range(action_num):
+                    state, reward, done, info = env_step(action)
+                    state = rgb2gray(state)
+
+                    if done:
+                        reward += 100  # don't penalize "die state"
+                    if state.mean() > 192:  # 185.0:  # penalize when outside of road
+                        reward -= 0.05
+
+                    env.reward_mean = env.reward_mean * 0.95 + reward * 0.05
+                    if env.reward_mean <= -0.1:  # done if car don't move
+                        done = True
+
+                    reward_sum += reward
+
+                    if done:
+                        break
+            except Exception as error:
+                print(f"| CarRacing-v0 Error 'stack underflow'? {error}")
+                reward_sum = 0
+                done = True
+            env.state_stack.pop(0)
+            env.state_stack.append(state)
+
+            return np.array(env.state_stack).flatten(), reward_sum, done, {}
+
+        return new_env_step
+
+    env.step = decorator_step(env.step)
+
+    def decorator_reset(env_reset):
+        def new_env_reset():
+            state = rgb2gray(env_reset())
+            env.state_stack = [state, ] * frame_num
+            return np.array(env.state_stack).flatten()
+
+        return new_env_reset
+
+    env.reset = decorator_reset(env.reset)
+    return env
+
+
+def render_car_racing():
+    import gym  # gym of OpenAI is not necessary for ElegantRL (even RL)
+    gym.logger.set_level(40)  # Block warning: 'WARN: Box bound precision lowered by casting to float32'
+    env = gym.make('CarRacing-v0')
+    env = fix_car_racing_env(env)
+
+    state_dim = env.state_dim
+
+    _state = env.reset()
+    import cv2
+    action = np.array((0, 1.0, -1.0))
+    for i in range(321):
+        # action = env.action_space.sample()
         state, reward, done, _ = env.step(action)
-        episode_return += reward
+        # env.render
+        show = state.reshape(state_dim)
+        show = ((show[0] + 1.0) * 128).astype(np.uint8)
+        cv2.imshow('', show)
+        cv2.waitKey(1)
         if done:
             break
-    episode_return = getattr(env, 'episode_return', episode_return)
-    return episode_return, episode_step
+        # env.render()
 
 
-def save_learning_curve(recorder, cwd='.', save_title='learning curve', fig_name='plot_learning_curve.jpg'):
-    recorder = np.array(recorder)  # recorder_ary.append((self.total_step, r_avg, r_std, obj_a, obj_c))
-    steps = recorder[:, 0]  # x-axis is training steps
-    r_avg = recorder[:, 1]
-    r_std = recorder[:, 2]
-    obj_c = recorder[:, 3]
-    obj_a = recorder[:, 4]
-
-    '''plot subplots'''
-    import matplotlib as mpl
-    mpl.use('Agg')
-    """Generating matplotlib graphs without a running X server [duplicate]
-    write `mpl.use('Agg')` before `import matplotlib.pyplot as plt`
-    https://stackoverflow.com/a/4935945/9293137
-    """
-    import matplotlib.pyplot as plt
-    fig, axs = plt.subplots(2)
-
-    axs0 = axs[0]
-    axs0.cla()
-    color0 = 'lightcoral'
-    axs0.set_xlabel('Total Steps')
-    axs0.set_ylabel('Episode Return')
-    axs0.plot(steps, r_avg, label='Episode Return', color=color0)
-    axs0.fill_between(steps, r_avg - r_std, r_avg + r_std, facecolor=color0, alpha=0.3)
-
-    ax11 = axs[1]
-    ax11.cla()
-    color11 = 'royalblue'
-    axs0.set_xlabel('Total Steps')
-    ax11.set_ylabel('objA', color=color11)
-    ax11.plot(steps, obj_a, label='objA', color=color11)
-    ax11.tick_params(axis='y', labelcolor=color11)
-    for plot_i in range(5, recorder.shape[1]):
-        other = recorder[:, plot_i]
-        ax11.plot(steps, other, label=f'{plot_i}', color='grey')
-
-    ax12 = axs[1].twinx()
-    color12 = 'darkcyan'
-    ax12.set_ylabel('objC', color=color12)
-    ax12.fill_between(steps, obj_c, facecolor=color12, alpha=0.2, )
-    ax12.tick_params(axis='y', labelcolor=color12)
-
-    '''plot save'''
-    plt.title(save_title, y=2.3)
-    plt.savefig(f"{cwd}/{fig_name}")
-    plt.close('all')  # avoiding warning about too many open figures, rcParam `figure.max_open_warning`
-    # plt.show()  # if use `mpl.use('Agg')` to draw figures without GUI, then plt can't plt.show()
+"""Utils"""
 
 
-def explore_before_training(env, target_step, reward_scale, gamma) -> (list, np.ndarray):  # for off-policy only
-    trajectory_list = list()
+def demo_get_video_to_watch_gym_render():
+    import cv2  # pip3 install opencv-python
+    import gym  # pip3 install gym==0.17 pyglet==1.5.0  # env.render() bug in gym==0.18, pyglet==1.6
+    import torch
 
-    if_discrete = env.if_discrete
-    action_dim = env.action_dim
+    """parameters"""
+    env_name = 'LunarLanderContinuous-v2'
+    env = PreprocessEnv(env=gym.make(env_name))
+
+    '''initialize agent'''
+    agent = None  # means use random action
+    if agent is None:  # use random action
+        device = None
+    else:
+        from elegantrl2.agent import AgentPPO
+        agent = AgentPPO()  # means use the policy network which saved in cwd
+        cwd = f'./{env_name}_{agent.__class__.__name__}/'  # current working directory path
+
+        net_dim = 2 ** 9  # 2 ** 7
+        state_dim = env.state_dim
+        action_dim = env.action_dim
+
+        agent.init(net_dim, state_dim, action_dim)
+        agent.save_load_model(cwd=cwd, if_save=False)
+        device = agent.device
+
+    '''initialize evaluete and env.render()'''
+    save_frame_dir = ''  # means don't save video, just open the env.render()
+    # save_frame_dir = 'frames'  # means save video in this directory
+    if save_frame_dir:
+        os.makedirs(save_frame_dir, exist_ok=True)
 
     state = env.reset()
+    episode_return = 0
     step = 0
-    while True:
-        if if_discrete:
-            action = rd.randint(action_dim)  # assert isinstance(action_int)
-            next_s, reward, done, _ = env.step(action)
-            other = (reward * reward_scale, 0.0 if done else gamma, action)
+    for i in range(2 ** 10):
+        print(i) if i % 128 == 0 else None
+        for j in range(1):
+            if agent is None:
+                action = env.action_space.sample()
+            else:
+                s_tensor = torch.as_tensor((state,), dtype=torch.float32, device=device)
+                a_tensor = agent.act(s_tensor)
+                action = a_tensor.detach().cpu().numpy()[0]  # if use 'with torch.no_grad()', then '.detach()' not need.
+            next_state, reward, done, _ = env.step(action)
+
+            episode_return += reward
+            step += 1
+
+            if done:
+                print(f'{i:>6}, {step:6.0f}, {episode_return:8.3f}, {reward:8.3f}')
+                state = env.reset()
+                episode_return = 0
+                step = 0
+            else:
+                state = next_state
+
+        if save_frame_dir:
+            frame = env.render('rgb_array')
+            cv2.imwrite(f'{save_frame_dir}/{i:06}.png', frame)
+            cv2.imshow('OpenCV Window', frame)
+            cv2.waitKey(1)
         else:
-            action = rd.uniform(-1, 1, size=action_dim)
-            next_s, reward, done, _ = env.step(action)
-            other = (reward * reward_scale, 0.0 if done else gamma, *action)
+            env.render()
+    env.close()
 
-        trajectory_list.append((state, other))
-        state = env.reset() if done else next_s
+    '''convert frames png/jpg to video mp4/avi using ffmpeg'''
+    if save_frame_dir:
+        frame_shape = cv2.imread(f'{save_frame_dir}/{3:06}.png').shape
+        print(f"frame_shape: {frame_shape}")
 
-        step += 1
-        if done and step > target_step:
-            break
-    return trajectory_list
+        save_video = 'gym_render.mp4'
+        os.system(f"| Convert frames to video using ffmpeg. Save in {save_video}")
+        os.system(f'ffmpeg -r 60 -f image2 -s {frame_shape[0]}x{frame_shape[1]} '
+                  f'-i ./{save_frame_dir}/%06d.png '
+                  f'-crf 25 -vb 20M -pix_fmt yuv420p {save_video}')
